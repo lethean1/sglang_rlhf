@@ -34,6 +34,31 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+
+@dataclass
+class SpecReqMigrationInfo:
+    #the message need to be sent when req migration
+    #shape (num_layers, kvcache_len, num_heads, head_dim)
+    target_model_kcache: List[torch.Tensor]
+    #shape (num_layers, kvcache_len, num_heads, head_dim)
+    target_model_vcache: List[torch.Tensor]
+    #shape (num_layers, kvcache_len, num_heads, head_dim)
+    draft_model_kcache: List[torch.Tensor]
+    #shape (num_layers, kvcache_len, num_heads, head_dim)
+    draft_model_vcache: List[torch.Tensor]
+
+    last_hidden_state: torch.Tensor
+    kvcache_len: int
+    request : Req
+    topk_p : List[int]  #length: topk
+    topk_index : List[int]  #length: topk
+    verified_id : int
+    
+    def __repr__(self):
+        return f"SpecReqMigrationInfo(request={self.request}, kvcache_len={self.kvcache_len})"
+    
+
+
 @dataclass
 class EagleDraftInput:
     # The inputs for decode
