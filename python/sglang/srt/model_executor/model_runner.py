@@ -100,6 +100,8 @@ class ModelRunner:
         tp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        world_rank: int,
+        world_size: int,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
@@ -123,6 +125,8 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.world_rank = world_rank
+        self.world_size = world_size
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -320,8 +324,10 @@ class ModelRunner:
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
-                world_size=self.tp_size,
-                rank=self.tp_rank,
+                world_size=self.world_size,
+                rank=self.world_rank,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
@@ -332,6 +338,7 @@ class ModelRunner:
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 dp_size=self.server_args.dp_size,
+                world_size=self.world_size,
             )
 
         min_per_gpu_memory = get_available_gpu_memory(

@@ -27,12 +27,16 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
+from zmq_link import ZmqClient
 
 import psutil
 import setproctitle
 import torch
 import zmq
 from torch.distributed import barrier
+import io
+import pickle
+import torch.distributed as dist
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -169,6 +173,8 @@ class Scheduler(
         gpu_id: int,
         tp_rank: int,
         dp_rank: Optional[int],
+        world_rank: int,
+        world_size: int,
     ):
         # Parse args
         self.server_args = server_args
@@ -187,6 +193,15 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
+        
+        self.world_rank = world_rank
+        self.world_size = world_size
+        zmq_endpoint = "tcp://{}:{}".format("localhost", 8899)
+        zmq_name = "client-system"+str(world_rank)
+        self.zmq_client = ZmqClient(zmq_name)
+        self.zmq_client.connect(zmq_endpoint)
+        self.zmq_client.send(world_rank)
+
 
         # Distributed rank info
         self.dp_size = server_args.dp_size
@@ -252,6 +267,8 @@ class Scheduler(
             tp_rank=tp_rank,
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
+            world_rank=world_rank,
+            world_size=world_size,
         )
 
         # Launch a draft worker for speculative decoding
@@ -451,6 +468,17 @@ class Scheduler(
                     revision=server_args.revision,
                 )
 
+    # wsq
+    def dist_test(self):
+        tensor = torch.tensor([self.world_rank]).cuda()
+        if self.world_rank == 0:
+            torch.distributed.send(tensor=tensor, dst=1)
+            print("rank 0 已发送数据",flush=True)
+        else:
+            recv_tensor = torch.zeros(1).cuda()
+            torch.distributed.recv(tensor=recv_tensor, src=0)
+            print(f"rank 1 收到数据: {recv_tensor.item()}",flush=True)
+
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
 
@@ -584,13 +612,283 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_infight_queue: List[Req] = []
 
+    # wsq
+    def check_req_migration(self):
+        if self.zmq_client.has_data():
+            print("zmq has data, rank: ",self.world_rank,flush=True)
+            msg = self.zmq_client.recv()
+            req_count, wrank, msg_type = msg.split('_')
+            if msg_type == 'send':
+                return True, False, int(req_count), int(wrank)
+            elif msg_type == 'recv':
+                return False, True, int(req_count), int(wrank)
+        return False, False, 0, 0
+    
+    
+    # wsq
+    def retrieve_kvcache_info(self, concatenated_tensor, modified_kvcache_info):
+        current_idx = 0
+        for req_kvcache in modified_kvcache_info:
+            layer_tensors = req_kvcache["layer_tensors"]
+            for layer_tensor in layer_tensors:
+                key_shape = layer_tensor[2]
+                key_dtype = layer_tensor[4]
+                value_shape = layer_tensor[3]
+                value_dtype = layer_tensor[5]
+                key_numel = torch.prod(torch.tensor(key_shape)).item()
+                value_numel = torch.prod(torch.tensor(value_shape)).item()
+                key_tensor = concatenated_tensor[current_idx:current_idx+key_numel].view(key_shape).type(key_dtype)
+                current_idx += key_numel
+                value_tensor = concatenated_tensor[current_idx:current_idx+value_numel].view(value_shape).type(value_dtype)
+                current_idx += value_numel
+                layer_tensor[0] = key_tensor
+                layer_tensor[1] = value_tensor
+                del layer_tensor[2:6]
+        return modified_kvcache_info
+    
+    # wsq
+    def save_kvcache_info_to_json(self, kvcache_info, filename="kvcache_info.json"):
+        imqport json
+        import numpy as np
+        
+        def tensor_to_list(tensor):
+            if isinstance(tensor, torch.Tensor):
+                return tensor.cpu().numpy().tolist()
+            return tensor
+            
+        serializable_info = []
+        for req_kvcache in kvcache_info:
+            serializable_req = {
+                "req_id": req_kvcache["req_id"],
+                "layer_tensors": []
+            }
+            for layer_tensor in req_kvcache["layer_tensors"]:
+                key_tensor = layer_tensor[0]
+                value_tensor = layer_tensor[1]
+                serializable_layer = {
+                    "key_tensor": tensor_to_list(key_tensor),
+                    "value_tensor": tensor_to_list(value_tensor),
+                    "key_shape": list(key_tensor.shape),
+                    "value_shape": list(value_tensor.shape),
+                    "key_dtype": str(key_tensor.dtype),
+                    "value_dtype": str(value_tensor.dtype)
+                }
+                serializable_req["layer_tensors"].append(serializable_layer)
+            serializable_info.append(serializable_req)
+            
+        with open(filename, 'w') as f:
+            json.dump(serializable_info, f, indent=2)
+        print(f"kvcache_info has saved to {filename}",flush=True)
+    
+    # wsq
+    def migrate_reqs_recv(self, src):           
+        concatenated_tensor, modified_kvcache_info = self.dist_recv_kvcache(src)
+        modified_kvcache_info = self._deserialize_object(modified_kvcache_info)
+        kvcache_info = self.retrieve_kvcache_info(concatenated_tensor, modified_kvcache_info)
+        
+        # save kvcache_info to json file
+        # self.save_kvcache_info_to_json(kvcache_info, f"kvcache_info_rank{self.world_rank}.json")
+        return kvcache_info
+    
+    # wsq
+    def process_kvcache_info(self, kvcache_info):
+        print(f"Processing kvcache_info for rank {self.world_rank}, length: {len(kvcache_info)}")
+        tensors = []
+        for req_kvcache in kvcache_info:
+            layer_tensors = req_kvcache["layer_tensors"]
+            idx = 0
+            for i, layer_tensor in enumerate(layer_tensors):
+                layer_tensors[i] = list(layer_tensor)
+                key_tensor = layer_tensors[i][0]
+                value_tensor = layer_tensors[i][1]
+                
+                tensors.append(key_tensor)
+                tensors.append(value_tensor)
+                
+                layer_tensors[i][0] = idx
+                idx += 1
+                layer_tensors[i][1] = idx
+                idx += 1
+                
+        if tensors:
+            first_tensor = tensors[0]
+            dtype = first_tensor.dtype
+            device = first_tensor.device
+            total_size = sum(t.numel() for t in tensors)
+            print(f"Total size of tensors: {total_size}, dtype: {dtype}, device: {device}")
+            concatenated_tensor = torch.empty(total_size, dtype=dtype, device=device)
+            current_idx = 0
+            for t in tensors:
+                num_elements = t.numel()
+                concatenated_tensor[current_idx:current_idx + num_elements] = t.view(-1)
+                current_idx += num_elements
+            return concatenated_tensor, kvcache_info
+        else:
+            print(f"No tensors found in kvcache_info for rank {self.world_rank}")
+            return None, None
+    
+    def dist_send_kvcache(self, modified_kvcache_info, concatenated_tensor, dst):
+        modified_kvcache_info = modified_kvcache_info.to(concatenated_tensor.device)
+        size_tensor = torch.tensor([concatenated_tensor.size(0)], dtype=torch.long).to(concatenated_tensor.device)
+        kvcache_size_tensor = torch.tensor([modified_kvcache_info.size(0)], dtype=torch.long).to(concatenated_tensor.device)
+        
+        send_op_list = []
+        print(size_tensor)
+        print(kvcache_size_tensor)
+        for size in [size_tensor, kvcache_size_tensor]:
+            send_op = dist.P2POp(dist.isend, size, dst)
+            send_op_list.append(send_op)
+        print(len(send_op_list),flush=True)
+        print(concatenated_tensor.device,modified_kvcache_info.device,flush=True)
+        print(size_tensor.device,kvcache_size_tensor.device,flush=True)
+        reqs = dist.batch_isend_irecv(send_op_list)
+        for req in reqs:
+            req.wait()
+        
+        print("send size data",flush=True)
+        # send data
+        send_op_list = []
+        for t in [concatenated_tensor,modified_kvcache_info]:
+            send_op = dist.P2POp(dist.isend, t, dst)
+            send_op_list.append(send_op)
+        reqs = dist.batch_isend_irecv(send_op_list)
+        for req in reqs:
+            req.wait()
+        return
+    
+    def dist_recv_kvcache(self, src):
+        size_tensor = torch.tensor([0], dtype=torch.long).to(self.device)
+        recv_op_list = []
+        recv_op = dist.P2POp(dist.irecv,size_tensor,src)
+        recv_op_list.append(recv_op)
+        kvcache_size_tensor = torch.tensor([0], dtype=torch.long).to(self.device)
+        recv_op_1 = dist.P2POp(dist.irecv,kvcache_size_tensor,src)
+        recv_op_list.append(recv_op_1)
+        reqs = dist.batch_isend_irecv(recv_op_list)
+        for req in reqs:
+            req.wait()
+        print("recv size data",flush=True)
+        recv_op_list = []
+        concatenated_tensor = torch.empty(size_tensor.item(), dtype=torch.float16).to(self.device)
+        recv_op = dist.P2POp(dist.irecv,concatenated_tensor,src)
+        recv_op_list.append(recv_op)
+        modified_kvcache_info = torch.empty(kvcache_size_tensor.item(), dtype=torch.uint8).to(self.device)
+        recv_op_1 = dist.P2POp(dist.irecv,modified_kvcache_info,src)
+        recv_op_list.append(recv_op_1)
+        reqs = dist.batch_isend_irecv(recv_op_list)
+        for req in reqs:
+            req.wait()
+        return concatenated_tensor, modified_kvcache_info
+        
+        
+    # wsq send the kvcache of the requests
+    def migrate_reqs_send(self,req_count, dst):          
+        reqs = self.running_batch.reqs[:req_count]
+        
+        # get the kvcache of the requests
+        t1 = time.time()
+        kvcache_info = self.get_req_kvcache_tensor(reqs)
+        t2 = time.time()
+        print(f"get_req_kvcache_tensor time: {t2-t1}",flush=True)
+        concatenated_tensor, modified_kvcache_info = self.process_kvcache_info(kvcache_info)
+        t3 = time.time()
+        print(f"process_kvcache_info time: {t3-t2}",flush=True)
+        modified_kvcache_info = self._serialize_object(modified_kvcache_info)
+        t4 = time.time()
+        print(f"_serialize_object time: {t4-t3}",flush=True)
+        self.dist_send_kvcache(modified_kvcache_info, concatenated_tensor, dst)
+        t5 = time.time()
+        print(f"dist_send_kvcache time: {t5-t4}",flush=True)
+        return
+    
+    # wsq
+    def _serialize_object(self, obj):
+        # Serialize object to a byte tensor
+        buffer = io.BytesIO()
+        pickle.dump(obj, buffer)
+        buffer.seek(0)
+        byte_array = buffer.read()
+        byte_tensor = torch.ByteTensor(list(byte_array))
+        return byte_tensor
+
+    # wsq
+    def _deserialize_object(self, byte_tensor):
+        # Deserialize object from a byte tensor
+        byte_array = byte_tensor.to('cpu').numpy().tobytes()
+        buffer = io.BytesIO(byte_array)
+        obj = pickle.load(buffer)
+        return obj
+    
+    # wsq
+    def get_running_reqs(self):
+        running_requests = self.running_batch.reqs
+        return running_requests
+    
+    def get_req_kvcache_tensor(self, reqs: List[Req]):
+        print(f"Getting kvcache for {len(reqs)} requests in rank {self.world_rank}")
+        all_reqs_kvcache = []
+        for req in reqs:
+            # get token indices
+            token_indices = req.prefix_indices
+            
+            # get KV cache object
+            kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+            
+            # get number of layers
+            num_layers = len(kvcache.k_buffer)
+            print(f"Number of layers in kvcache: {num_layers}")
+            
+            # store tensors for each layer
+            layer_tensors = []
+            
+            for layer_id in range(num_layers):
+                # get key and value tensor
+                key_tensor = kvcache.get_key_buffer(layer_id)
+                value_tensor = kvcache.get_value_buffer(layer_id)
+                
+                # handle page size
+                if self.page_size > 1:
+                    page_aligned_len = len(token_indices) // self.page_size * self.page_size
+                    page_aligned_indices = token_indices[:page_aligned_len]
+                    
+                    key_cache = key_tensor[page_aligned_indices].clone()
+                    value_cache = value_tensor[page_aligned_indices].clone()
+                else:
+                    key_cache = key_tensor[token_indices].clone()
+                    value_cache = value_tensor[token_indices].clone()
+                
+                print(f"Layer {layer_id} key shape: {key_cache.shape}, value shape: {value_cache.shape}, key device: {key_cache.device}, value device: {value_cache.device}")
+                layer_tensors.append((key_cache, value_cache, key_cache.shape, value_cache.shape, key_cache.dtype, value_cache.dtype))
+                
+            req_kv_cache = {
+                "req_id": req.rid,
+                "layer_tensors": layer_tensors
+            }
+            all_reqs_kvcache.append(req_kv_cache)
+            
+        print(f"Total number of requests with kvcache: {len(all_reqs_kvcache)}")
+        return all_reqs_kvcache
+    
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-
+            # if self.zmq_client.has_data():
+            #     print("zmq has data, rank: ",self.world_rank,flush=True)
+            #     print(self.zmq_client.recv(),flush=True)
+            #     self.dist_test()
+                
+            has_migration_send, has_migration_recv, req_count, wrank = self.check_req_migration()
+            if has_migration_send:
+                self.migrate_reqs_send(req_count, wrank)
+                
+            if has_migration_recv:
+                kvcache_info = self.migrate_reqs_recv(wrank)
+                
+                        
+                
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -844,8 +1142,8 @@ class Scheduler(
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self._add_request_to_queue(req)
-                return
-
+            return
+            
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
@@ -1969,6 +2267,8 @@ def run_scheduler_process(
     tp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    world_rank: int,
+    world_size: int,
 ):
     # Generate the prefix
     if dp_rank is None:
@@ -1996,7 +2296,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
-        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
+        scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank, world_rank, world_size)
         pipe_writer.send(
             {
                 "status": "ready",

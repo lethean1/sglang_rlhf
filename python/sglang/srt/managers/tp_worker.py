@@ -49,6 +49,8 @@ class TpModelWorker:
         tp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        world_rank: int,
+        world_size: int,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
@@ -79,6 +81,8 @@ class TpModelWorker:
             tp_size=server_args.tp_size,
             nccl_port=nccl_port,
             server_args=server_args,
+            world_rank=world_rank,
+            world_size=world_size,
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -125,10 +129,17 @@ class TpModelWorker:
         ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
+        print('==========rank, tp rank, group', world_rank, self.tp_rank, self.model_runner.tp_group.cpu_group)
+        print(torch.distributed.get_rank(group=self.model_runner.tp_group.cpu_group))
+        print("rank, group, src:", self.tp_rank, torch.distributed.get_rank(group=self.model_runner.tp_group.cpu_group), flush=True)
+        print("world_rank",world_rank, flush=True)
+        # wsq
+        src = world_rank//server_args.tp_size*server_args.tp_size
         self.random_seed = broadcast_pyobj(
             [server_args.random_seed],
             self.tp_rank,
             self.model_runner.tp_group.cpu_group,
+            src
         )[0]
         set_random_seed(self.random_seed)
 

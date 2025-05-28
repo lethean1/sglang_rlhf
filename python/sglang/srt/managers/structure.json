@@ -1,0 +1,12 @@
+
+kvcache_info = {
+    "tp_rank": self.tp_rank,
+    "kvcache": all_reqs_kvcache
+}
+
+all_reqs_kvcache.append(req_kv_cache)
+req_kv_cache = {
+    "req_id": req.rid,
+    "layer_tensors": layer_tensors
+}
+layer_tensors.append((key_cache, value_cache))

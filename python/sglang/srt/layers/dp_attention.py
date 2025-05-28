@@ -43,6 +43,7 @@ def initialize_dp_attention(
     tp_rank: int,
     tp_size: int,
     dp_size: int,
+    world_size: int,
 ):
     global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK, _DP_SIZE
 
@@ -61,7 +62,7 @@ def initialize_dp_attention(
     _ATTN_TP_GROUP = GroupCoordinator(
         [
             list(range(head, head + _ATTN_TP_SIZE))
-            for head in range(0, tp_size, _ATTN_TP_SIZE)
+            for head in range(0, world_size, _ATTN_TP_SIZE)
         ],
         tp_group.local_rank,
         torch.distributed.get_backend(tp_group.device_group),

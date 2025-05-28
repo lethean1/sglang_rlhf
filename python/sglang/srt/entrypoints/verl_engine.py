@@ -27,6 +27,8 @@ from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj
 class VerlEngine:
     def __init__(
         self,
+        world_rank: int,
+        world_size: int,
         device_mesh_cpu: DeviceMesh,
         nnodes: int = 1,
         **kwargs,
@@ -42,7 +44,7 @@ class VerlEngine:
         if first_rank_in_node:
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
             self._engine = Engine(
-                **kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes
+                **kwargs, tp_size=self._tp_size, node_rank=node_rank, nnodes=nnodes, world_rank=world_rank, world_size=world_size
             )
         else:
             self._engine = None

@@ -20,6 +20,7 @@ import os
 import random
 import tempfile
 from typing import List, Optional
+from multiprocessing import SimpleQueue
 
 from sglang.srt.hf_transformers_utils import check_gguf_file
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -44,6 +45,9 @@ logger = logging.getLogger(__name__)
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
+    world_rank: int
+    world_size: int
+    
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
@@ -354,6 +358,18 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        parser.add_argument(
+            "--world-rank",
+            type=int,
+            help="world-rank",
+            required=True,
+        )
+        parser.add_argument(
+            "--world-size",
+            type=int,
+            help="world-size",
+            required=True,
+        )
         # Model and port args
         parser.add_argument(
             "--model-path",
@@ -1182,9 +1198,10 @@ class PortArgs:
     # The ipc filename for rpc call between Engine and Scheduler
     rpc_ipc_name: str
 
+    # wsq
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
-        port = server_args.port + random.randint(100, 1000)
+        port = server_args.port
         while True:
             if is_port_available(port):
                 break

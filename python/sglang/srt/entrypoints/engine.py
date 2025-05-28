@@ -26,6 +26,7 @@ import os
 import signal
 import threading
 from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+import time
 
 import zmq
 import zmq.asyncio
@@ -112,6 +113,7 @@ class Engine:
         # Allocate ports for inter-process communications
         port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
+        
 
         # Launch subprocesses
         tokenizer_manager, scheduler_info = _launch_subprocesses(
@@ -127,6 +129,7 @@ class Engine:
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, port_args.rpc_ipc_name, True
         )
+            
 
     def generate(
         self,
@@ -450,7 +453,15 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
-
+    
+# wsq    
+def wsq_worker(queue):
+    time.sleep(1)
+    while True:
+        if not queue.empty():
+            print("wsq_worker")
+            print(queue.get())
+            break
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
@@ -472,6 +483,7 @@ def _launch_subprocesses(
     server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
         server_args.model_path, server_args.tokenizer_path
     )
+    
 
     scheduler_procs = []
     if server_args.dp_size == 1:
@@ -492,12 +504,14 @@ def _launch_subprocesses(
                 server_args.base_gpu_id
                 + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
             )
+            print(tp_rank_range)
             proc = mp.Process(
                 target=run_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, None, writer),
+                args=(server_args, port_args, gpu_id, tp_rank, None, writer, server_args.world_rank+tp_rank, server_args.world_size),
             )
             with memory_saver_adapter.configure_subprocess():
                 proc.start()
+
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
     else:
