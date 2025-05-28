@@ -468,16 +468,6 @@ class Scheduler(
                     revision=server_args.revision,
                 )
 
-    # wsq
-    def dist_test(self):
-        tensor = torch.tensor([self.world_rank]).cuda()
-        if self.world_rank == 0:
-            torch.distributed.send(tensor=tensor, dst=1)
-            print("rank 0 已发送数据",flush=True)
-        else:
-            recv_tensor = torch.zeros(1).cuda()
-            torch.distributed.recv(tensor=recv_tensor, src=0)
-            print(f"rank 1 收到数据: {recv_tensor.item()}",flush=True)
 
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
@@ -758,23 +748,21 @@ class Scheduler(
     
     def dist_recv_kvcache(self, src):
         size_tensor = torch.tensor([0], dtype=torch.long).to(self.device)
-        recv_op_list = []
-        recv_op = dist.P2POp(dist.irecv,size_tensor,src)
-        recv_op_list.append(recv_op)
         kvcache_size_tensor = torch.tensor([0], dtype=torch.long).to(self.device)
-        recv_op_1 = dist.P2POp(dist.irecv,kvcache_size_tensor,src)
-        recv_op_list.append(recv_op_1)
+        recv_op_list = []
+        for t in [size_tensor, kvcache_size_tensor]:
+            recv_op = dist.P2POp(dist.irecv,t,src)
+            recv_op_list.append(recv_op)
         reqs = dist.batch_isend_irecv(recv_op_list)
         for req in reqs:
             req.wait()
         print("recv size data",flush=True)
         recv_op_list = []
         concatenated_tensor = torch.empty(size_tensor.item(), dtype=torch.float16).to(self.device)
-        recv_op = dist.P2POp(dist.irecv,concatenated_tensor,src)
-        recv_op_list.append(recv_op)
         modified_kvcache_info = torch.empty(kvcache_size_tensor.item(), dtype=torch.uint8).to(self.device)
-        recv_op_1 = dist.P2POp(dist.irecv,modified_kvcache_info,src)
-        recv_op_list.append(recv_op_1)
+        for t in [concatenated_tensor, modified_kvcache_info]:
+            recv_op = dist.P2POp(dist.irecv,t,src)
+            recv_op_list.append(recv_op)
         reqs = dist.batch_isend_irecv(recv_op_list)
         for req in reqs:
             req.wait()

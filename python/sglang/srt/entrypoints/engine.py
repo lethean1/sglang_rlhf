@@ -454,14 +454,6 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set mp start method
     mp.set_start_method("spawn", force=True)
     
-# wsq    
-def wsq_worker(queue):
-    time.sleep(1)
-    while True:
-        if not queue.empty():
-            print("wsq_worker")
-            print(queue.get())
-            break
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
