@@ -2195,6 +2195,260 @@ class Scheduler(
                 ProfileReqOutput(success=True, message="Succeeded.")
             )
 
+    def test_migrate_function(self, batch : ScheduleBatch):
+        if self.world_rank == 0:
+            if self.draft_worker.cur_decoding_step in self.draft_worker.migrate_01_steps and len(batch.reqs) > 1:
+                send_command = True
+                recv_command = False
+                message = "111"
+                return send_command, recv_command, message
+        elif self.world_rank == 1:
+            if self.draft_worker.cur_decoding_step in self.draft_worker.migrate_01_steps:
+                send_command = False
+                recv_command = True
+                message = "111"
+                return send_command, recv_command, message
+        if self.zmq_client.has_data():
+            send_command = False
+            recv_command = True
+            message = self.zmq_client.recv()
+            return send_command, recv_command, message
+        return False, False, None
+            
+    def schedule_migrate_batch(self, batch : ScheduleBatch):
+        #send_state_report(state_report)
+        #migrate_command = recv_migrate_command()
+        send_command, recv_command, message = self.test_migrate_function(batch)
+        if send_command:
+            send_time_record_file = "/sglang/outputs/send_time_record_time.txt"
+
+            with open(send_time_record_file, 'a') as f_time_log:
+                log_prefix = f"Rank {self.world_rank}: "
+
+                f_time_log.write(f"{time.time()}: {log_prefix}start send function time\n")
+                f_time_log.flush()
+
+                migrate_req_list = self.draft_worker.send_req_migrate(batch, [0], self.tree_cache)
+                concatenated_tensor, metadata = self.process_spec_req_list_for_sending(migrate_req_list)
+                
+                f_time_log.write(f"{time.time()}: {log_prefix}start serialize metadata time\n")
+                f_time_log.flush()
+                
+                bytemetadata = self._serialize_object(metadata).to(self.device)
+
+                dst_dp_rank = 1 if self.dp_rank == 0 else 0
+                dst_rank = dst_dp_rank * self.server_args.tp_size + self.tp_rank
+                #self.zmq_client.send(zmq_metadata)
+                f_time_log.write(f"{time.time()}: {log_prefix}start isend size tensor time\n")
+                f_time_log.flush()
+                f_time_log.write(f"{log_prefix}concatenated tensor size {concatenated_tensor.numel()}\n")
+                f_time_log.flush()
+                f_time_log.write(f"{log_prefix}bytemetadata tensor size {bytemetadata.numel()}\n")
+                f_time_log.flush()
+
+                concatenated_tensor_size = torch.tensor([concatenated_tensor.numel()],dtype=torch.int32,device=self.device)
+                bytemetadata_tensor_size = torch.tensor([bytemetadata.numel()],dtype=torch.int32,device=self.device)
+                send_op_list = []
+                for t in [concatenated_tensor_size, bytemetadata_tensor_size]:
+                    send_op = dist.P2POp(dist.isend, t, dst_rank)
+                    send_op_list.append(send_op)           
+    
+                reqs = dist.batch_isend_irecv(send_op_list)
+                
+                f_time_log.write(f"{time.time()}: {log_prefix}begin wait size tensor time\n")
+                f_time_log.flush()      
+                
+                for req in reqs:
+                    req.wait()
+
+                f_time_log.write(f"{time.time()}: {log_prefix}begin isend actual tensor time\n")
+                f_time_log.flush()
+
+                send_op_list = []
+                for t in [concatenated_tensor, bytemetadata]:
+                    send_op = dist.P2POp(dist.isend, t, dst_rank)
+                    send_op_list.append(send_op)                   
+                    
+                reqs = dist.batch_isend_irecv(send_op_list)
+                
+                f_time_log.write(f"{time.time()}: {log_prefix}begin wait actual tensor time\n")
+                f_time_log.flush()                 
+
+                for req in reqs:
+                    req.wait()
+
+                f_time_log.write(f"{time.time()}: {log_prefix}after send actual tensor time\n")
+                f_time_log.flush()
+            
+        elif recv_command:
+            recv_time_record_file = "/sglang/outputs/recv_time_record_time.txt"
+
+            with open(recv_time_record_file, 'a') as f_time_log:
+                log_prefix = f"Rank {self.world_rank}: "
+
+                f_time_log.write(f"{time.time()}: {log_prefix}start recv function time\n")
+                f_time_log.flush()
+
+                src_dp_rank = 1 if self.dp_rank == 0 else 0
+                src_rank = src_dp_rank * self.server_args.tp_size + self.tp_rank
+
+                concat_tensor_size_buffer = torch.tensor([0], device=self.device, dtype=torch.int32)
+                bytemetadata_size_buffer = torch.tensor([0], device=self.device, dtype=torch.int32)
+
+                f_time_log.write(f"{time.time()}: {log_prefix}begin irecv size tensor time\n")
+                f_time_log.flush()
+
+                recv_op_list = []
+                for t in [concat_tensor_size_buffer, bytemetadata_size_buffer]:
+                    recv_op_list.append(dist.P2POp(dist.irecv, t, src_rank))
+
+                reqs = dist.batch_isend_irecv(recv_op_list)
+                
+                f_time_log.write(f"{time.time()}: {log_prefix}begin wait size tensor time\n")
+                f_time_log.flush()                
+
+                for req in reqs:
+                    req.wait()
+
+                concat_numel = concat_tensor_size_buffer.item()
+                bytemetadata_numel = bytemetadata_size_buffer.item()
+
+                concat_dtype = self.draft_worker.model_runner.dtype
+
+                received_concatenated_tensor = torch.empty(concat_numel, dtype=concat_dtype, device=self.device)
+                received_bytemetadata_tensor = torch.empty(bytemetadata_numel, dtype=torch.uint8, device=self.device)
+
+                f_time_log.write(f"{time.time()}: {log_prefix}begin irecv actual tensor time\n")
+                f_time_log.flush()
+
+                recv_op_list = []
+                for t in [received_concatenated_tensor, received_bytemetadata_tensor]:
+                    recv_op_list.append(dist.P2POp(dist.irecv, t, src_rank))                
+
+                reqs = dist.batch_isend_irecv(recv_op_list)
+                
+                f_time_log.write(f"{time.time()}: {log_prefix}begin wait actual tensor time\n")
+                f_time_log.flush()
+
+                for req in reqs:
+                    req.wait()
+
+                # Capture time once before formatting the string for more accurate timing of the event
+                f_time_log.write(f"{time.time()}: {log_prefix}after recv actual tensor time\n")
+                f_time_log.flush()                
+
+
+                reconstructed_metadata = self._deserialize_object(received_bytemetadata_tensor)
+                f_time_log.write(f"{time.time()}: {log_prefix}Metadata deserialized successfully.\n")
+                f_time_log.flush()
+
+                spec_info_list = self.reconstruct_spec_req_list_from_received(received_concatenated_tensor, reconstructed_metadata)
+                self.draft_worker.recv_req_migrate(batch, spec_info_list, self.tree_cache)
+
+                f_time_log.write(f"{time.time()}: {log_prefix}end recv time\n")
+                f_time_log.flush()
+            
+
+    def process_spec_req_list_for_sending(
+        self,
+        spec_req_list: List[SpecReqMigrationInfo]
+    ) -> Tuple[torch.Tensor, List[Dict]]:
+
+        all_tensors_to_concat : List[torch.Tensor] = []
+        processed_metadata_list = []
+
+        for original_req_info in spec_req_list:
+            req_metadata = {
+                "request": original_req_info.request,
+                "kvcache_len": original_req_info.kvcache_len,
+                "topk_p": original_req_info.topk_p,
+                "topk_index": original_req_info.topk_index,
+                "verified_id": original_req_info.verified_id,
+                "_tensor_metadata_internal": []
+            }
+            
+            tensor_fields = [
+                ("target_model_kcache", original_req_info.target_model_kcache),
+                ("target_model_vcache", original_req_info.target_model_vcache),
+                ("draft_model_kcache", original_req_info.draft_model_kcache),
+                ("draft_model_vcache", original_req_info.draft_model_vcache),
+                ("last_hidden_state", [original_req_info.last_hidden_state] if original_req_info.last_hidden_state is not None else [])
+            ]
+
+            for field_name, tensor_list_or_single in tensor_fields:
+                actual_tensor_list = tensor_list_or_single if isinstance(tensor_list_or_single, list) else [tensor_list_or_single]
+                for idx, tensor in enumerate(actual_tensor_list):
+                    if tensor is None: continue
+                    all_tensors_to_concat.append(tensor)
+                    numel = tensor.numel()
+                    # (field_name, index_in_list, original_shape, dtype_str, numel_in_concat, offset_in_concat)
+                    tensor_meta = (field_name, idx, tuple(tensor.shape), str(tensor.dtype), numel)
+                    req_metadata["_tensor_metadata_internal"].append(tensor_meta)
+            
+            processed_metadata_list.append(req_metadata)
+
+        if not all_tensors_to_concat:
+            return None, None
+
+        target_dtype = all_tensors_to_concat[0].dtype
+
+        total_numel = sum(t.numel() for t in all_tensors_to_concat)
+        concatenated_tensor = torch.empty(total_numel, dtype=target_dtype, device=self.device)
+        
+        current_offset = 0
+        for i, tensor in enumerate(all_tensors_to_concat):
+            numel = tensor.numel()
+            concatenated_tensor[current_offset : current_offset + numel].copy_(tensor.view(-1).to(target_dtype))
+            current_offset += numel
+            
+        return concatenated_tensor, processed_metadata_list
+
+
+    def reconstruct_spec_req_list_from_received(
+        self,
+        concatenated_tensor: torch.Tensor,
+        processed_metadata_list: List[Dict]
+    ) -> List[SpecReqMigrationInfo]:
+
+        reconstructed_spec_req_list = []
+        current_concat_offset = 0
+
+        for req_metadata in processed_metadata_list:
+            new_spec_req = SpecReqMigrationInfo(
+                request=req_metadata["request"],
+                kvcache_len=req_metadata["kvcache_len"],
+                topk_p=req_metadata["topk_p"],
+                topk_index=req_metadata["topk_index"],
+                verified_id=req_metadata["verified_id"],
+            )
+
+            reconstructed_tensors_map = {
+                "target_model_kcache": [], "target_model_vcache": [],
+                "draft_model_kcache": [], "draft_model_vcache": [],
+                "last_hidden_state": None
+            }
+
+            for field_name, original_list_idx, shape, dtype_str, numel in req_metadata["_tensor_metadata_internal"]:
+              
+                tensor_slice = concatenated_tensor[current_concat_offset : current_concat_offset + numel]
+                restored_tensor = tensor_slice.view(shape)
+                current_concat_offset += numel
+
+                if field_name == "last_hidden_state":
+                    reconstructed_tensors_map[field_name] = restored_tensor
+                else:
+                    reconstructed_tensors_map[field_name].append(restored_tensor)
+            
+            new_spec_req.target_model_kcache = reconstructed_tensors_map["target_model_kcache"]
+            new_spec_req.target_model_vcache = reconstructed_tensors_map["target_model_vcache"]
+            new_spec_req.draft_model_kcache = reconstructed_tensors_map["draft_model_kcache"]
+            new_spec_req.draft_model_vcache = reconstructed_tensors_map["draft_model_vcache"]
+            new_spec_req.last_hidden_state = reconstructed_tensors_map["last_hidden_state"]
+            
+            reconstructed_spec_req_list.append(new_spec_req)
+            
+        return reconstructed_spec_req_list
+    
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         if recv_req == ExpertDistributionReq.START_RECORD:
             expert_distribution_recorder.start_record()
